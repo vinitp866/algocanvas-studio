@@ -361,14 +361,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       <button onclick="openQrModal()">Phone QR</button>
       <button onclick="syncSharedGraph()">Sync Phone Graph</button>
     </div>
-    <div>
-      <label for="parse-mode">Parser Mode</label>
-      <select id="parse-mode">
-        <option value="auto" selected>Auto (Cloud -> Local)</option>
-        <option value="offline">Offline (OpenCV + MNIST-12)</option>
-        <option value="cloud">Cloud (Groq)</option>
-      </select>
-    </div>
 
     <div class="divider"></div>
     <h2 class="panel-title">Graph Canvas Tools</h2>
@@ -412,7 +404,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <div class="canvas-frame">
-      <canvas id="graph-canvas" width="920" height="540"></canvas>
+      <canvas id="graph-canvas" height="540"></canvas>
     </div>
 
     <div class="timeline-bar">
@@ -506,14 +498,35 @@ let camStream = null;
 let leftCollapsed = false;
 let rightCollapsed = false;
 
+function rescaleNodesToCanvas(oldW, oldH, newW, newH) {
+  if (!graph.nodes.length || !oldW || !oldH || (oldW === newW && oldH === newH)) return;
+  const padX = 64, padY = 56;
+  const oldSpanW = Math.max(1, oldW - padX * 2);
+  const oldSpanH = Math.max(1, oldH - padY * 2);
+  const newSpanW = Math.max(1, newW - padX * 2);
+  const newSpanH = Math.max(1, newH - padY * 2);
+
+  for (const n of graph.nodes) {
+    const ratioX = Math.max(0, Math.min(1, (n.x - padX) / oldSpanW));
+    const ratioY = Math.max(0, Math.min(1, (n.y - padY) / oldSpanH));
+    n.x = Math.round(padX + ratioX * newSpanW);
+    n.y = Math.round(padY + ratioY * newSpanH);
+  }
+}
+
 function syncCanvasResolution() {
   const frame = document.querySelector(".canvas-frame");
   if (!frame) return;
-  const targetW = Math.max(480, Math.round(frame.clientWidth));
-  if (canvas.width !== targetW) {
+  const rect = frame.getBoundingClientRect();
+  const targetW = Math.max(320, Math.floor(rect.width));
+  const targetH = Math.max(360, Math.floor(rect.height));
+  if (canvas.width !== targetW || canvas.height !== targetH) {
+    const oldW = canvas.width;
+    const oldH = canvas.height;
     canvas.width = targetW;
+    canvas.height = targetH;
+    rescaleNodesToCanvas(oldW, oldH, targetW, targetH);
   }
-  canvas.height = 540;
 }
 
 function toggleDrawer(side) {
@@ -529,7 +542,14 @@ function toggleDrawer(side) {
   }
   layout.classList.toggle("left-collapsed", leftCollapsed);
   layout.classList.toggle("right-collapsed", rightCollapsed);
-  setTimeout(syncCanvasResolution, 260);
+
+  syncCanvasResolution();
+  const start = performance.now();
+  function refitDuringTransition(ts) {
+    syncCanvasResolution();
+    if (ts - start < 320) requestAnimationFrame(refitDuringTransition);
+  }
+  requestAnimationFrame(refitDuringTransition);
 }
 
 function parseHeuristicInput(raw) {
@@ -723,12 +743,12 @@ function fitGraphToCanvas() {
 }
 
 async function uploadImageBlob(blobOrFile, filename) {
-  const mode = document.getElementById("parse-mode").value;
+  const mode = "cloud";
   const fd = new FormData();
   fd.append("image", blobOrFile, filename);
   fd.append("mode", mode);
 
-  setStatus("Scanning & parsing sketch photo...");
+  setStatus("Scanning & parsing sketch photo via Groq...");
   try {
     const res = await fetch("/api/parse", { method: "POST", body: fd });
     const data = await res.json();
@@ -757,14 +777,19 @@ function loadSampleGraph() {
   stopPlay();
   steps = [];
   stepIndex = 0;
+  const w = canvas.width;
+  const h = canvas.height;
+  const lx = (frac) => Math.round(64 + frac * Math.max(200, w - 128));
+  const ly = (frac) => Math.round(56 + frac * Math.max(200, h - 112));
+
   graph = {
     nodes: [
-      { id: "1", x: 150, y: 155, r: 22 },
-      { id: "2", x: 365, y: 115, r: 22 },
-      { id: "3", x: 365, y: 335, r: 22 },
-      { id: "4", x: 590, y: 145, r: 22 },
-      { id: "5", x: 590, y: 355, r: 22 },
-      { id: "6", x: 780, y: 250, r: 22 },
+      { id: "1", x: lx(0.08), y: ly(0.28), r: 22 },
+      { id: "2", x: lx(0.34), y: ly(0.18), r: 22 },
+      { id: "3", x: lx(0.34), y: ly(0.68), r: 22 },
+      { id: "4", x: lx(0.64), y: ly(0.24), r: 22 },
+      { id: "5", x: lx(0.64), y: ly(0.72), r: 22 },
+      { id: "6", x: lx(0.90), y: ly(0.48), r: 22 },
     ],
     edges: [
       { source: "1", target: "2", weight: 4 },
@@ -1090,7 +1115,6 @@ function drawScene(now) {
       ctx.strokeStyle = "#a66c14";
       ctx.lineWidth = 5.5;
     } else if (isTree) {
-      ctx.strokeStyle = "#1d4ed8";
       ctx.strokeStyle = "#1e4d38";
       ctx.lineWidth = 4.8;
     } else if (isHovered) {
@@ -1193,6 +1217,12 @@ function drawScene(now) {
   requestAnimationFrame(drawScene);
 }
 
+window.addEventListener("resize", syncCanvasResolution);
+if (window.ResizeObserver) {
+  const frameEl = document.querySelector(".canvas-frame");
+  if (frameEl) new ResizeObserver(syncCanvasResolution).observe(frameEl);
+}
+syncCanvasResolution();
 loadSampleGraph();
 toggleTarget();
 requestAnimationFrame(drawScene);
@@ -1252,7 +1282,7 @@ class AlgoCanvasHandler(BaseHTTPRequestHandler):
 
             if self.path == "/api/parse":
                 ctype = self.headers.get("Content-Type", "")
-                mode = "auto"
+                mode = "cloud"
                 img_bytes = None
 
                 if "multipart/form-data" in ctype and "boundary=" in ctype:
@@ -1267,7 +1297,7 @@ class AlgoCanvasHandler(BaseHTTPRequestHandler):
                             content = content[:-2].rstrip(b"\r\n")
                         headers_str = header_part.decode("utf-8", errors="ignore")
                         if 'name="mode"' in headers_str:
-                            mode = content.decode("utf-8", errors="ignore").strip() or "auto"
+                            mode = content.decode("utf-8", errors="ignore").strip() or "cloud"
                         elif 'name="image"' in headers_str:
                             img_bytes = content
 
@@ -1281,6 +1311,10 @@ class AlgoCanvasHandler(BaseHTTPRequestHandler):
 
                 try:
                     parsed = extract_graph(tmp_path, mode=mode, save_debug=False)
+                except Exception as exc:
+                    print(f"[/api/parse error] {type(exc).__name__}: {exc}")
+                    self._send_json({"error": str(exc)}, 500)
+                    return
                 finally:
                     if os.path.exists(tmp_path):
                         os.remove(tmp_path)
